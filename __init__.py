@@ -16,6 +16,13 @@ Features:
 """
 
 import os
+os.environ["AIOHTTP_NOSENDFILE"] = "1"
+try:
+    import aiohttp.web_fileresponse
+    aiohttp.web_fileresponse.NOSENDFILE = True
+except Exception:
+    pass
+
 import sys
 import time
 import shutil
@@ -43,7 +50,7 @@ if sys.platform == 'win32':
         pass
 
 # Allowed video extensions for input validation
-ALLOWED_VIDEO_EXTS = {'.mp4', '.mov', '.avi',  '.m4v', '.webm'}
+ALLOWED_VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.flv', '.wmv', '.m4v', '.webm'}
 
 # Global concurrency control: at most 2 FFmpeg transcode jobs run simultaneously
 _transcode_semaphore = asyncio.Semaphore(2)
@@ -70,17 +77,16 @@ async def monitor_ws_handler(request):
             "data": { "status": server.get_queue_info() }
         })
 
-        # If a node is currently executing, send it immediately
+        # Send current execution state immediately (active node if running, or node: None if idle)
         last_node_id = getattr(server, "last_node_id", None)
         last_prompt_id = getattr(server, "last_prompt_id", None)
-        if last_node_id is not None:
-            await ws.send_json({
-                "type": "executing",
-                "data": {
-                    "node": last_node_id,
-                    "prompt_id": last_prompt_id
-                }
-            })
+        await ws.send_json({
+            "type": "executing",
+            "data": {
+                "node": last_node_id,
+                "prompt_id": last_prompt_id
+            }
+        })
 
         # Keep connection open and handle incoming messages/pings
         async for msg in ws:
@@ -274,7 +280,142 @@ async def _transcode_to_webm(source_file, dest_file):
     return False
 
 
-# 4. Register on-demand WebM conversion endpoint: /api/video_to_webm and /video_to_webm
+# 4. Register video streaming & on-demand WebM conversion endpoints
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+    "Access-Control-Allow-Headers": "*"
+}
+
+async def video_stream_direct(request, file_path, content_type="video/webm"):
+    """Stream video file in chunks with HTTP Range (byte-range) support to bypass Windows aiohttp sendfile stalls."""
+    if not file_path or not os.path.isfile(file_path):
+        return web.Response(status=404, headers=CORS_HEADERS)
+
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        return web.Response(status=404, headers=CORS_HEADERS)
+
+    # Handle HTTP Range requests (essential for HTML5 video seek, scrub, and CEF playback)
+    range_header = request.headers.get("Range")
+    if range_header and range_header.startswith("bytes="):
+        try:
+            ranges = range_header.replace("bytes=", "").split("-")
+            start = int(ranges[0]) if ranges[0] else 0
+            end = int(ranges[1]) if len(ranges) > 1 and ranges[1] else file_size - 1
+            if start >= file_size or end >= file_size or start > end:
+                return web.Response(status=416, headers={
+                    **CORS_HEADERS,
+                    "Content-Range": f"bytes */{file_size}"
+                })
+
+            length = end - start + 1
+            resp = web.StreamResponse(status=206, headers={
+                **CORS_HEADERS,
+                "Content-Type": content_type,
+                "Content-Length": str(length),
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-cache",
+            })
+            await resp.prepare(request)
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk_size = min(65536, remaining)
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    await resp.write(chunk)
+                    remaining -= len(chunk)
+            await resp.write_eof()
+            return resp
+        except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+            return resp
+        except Exception:
+            pass
+
+    # Standard full file stream
+    resp = web.StreamResponse(status=200, headers={
+        **CORS_HEADERS,
+        "Content-Type": content_type,
+        "Content-Length": str(file_size),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+    })
+    try:
+        await resp.prepare(request)
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                await resp.write(chunk)
+        await resp.write_eof()
+    except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+        pass
+    return resp
+
+
+@server.routes.options('/api/video_stream')
+@server.routes.options('/video_stream')
+async def video_stream_options(request):
+    return web.Response(status=204, headers=CORS_HEADERS)
+
+
+@server.routes.head('/api/video_stream')
+@server.routes.head('/video_stream')
+async def video_stream_head(request):
+    params = request.query
+    filename = params.get('filename', '').strip()
+    subfolder = (params.get('subfolder', '') or '').replace('\\', '/').strip('/')
+    folder_type = params.get('type', 'output').strip()
+
+    if not filename or '\0' in filename or ".." in filename or ".." in subfolder:
+        return web.Response(status=400, headers=CORS_HEADERS)
+
+    source_path = _find_source_video(filename, subfolder, folder_type)
+    if not source_path or not os.path.isfile(source_path):
+        return web.Response(status=404, headers=CORS_HEADERS)
+
+    file_size = os.path.getsize(source_path)
+    ext = os.path.splitext(filename)[1].lower()
+    content_type = "video/webm" if ext == ".webm" else "video/mp4"
+
+    return web.Response(status=200, headers={
+        **CORS_HEADERS,
+        "Content-Type": content_type,
+        "Content-Length": str(file_size),
+        "Accept-Ranges": "bytes",
+    })
+
+
+@server.routes.get('/api/video_stream')
+@server.routes.get('/video_stream')
+async def video_stream_handler(request):
+    params = request.query
+    filename = params.get('filename', '').strip()
+    subfolder = (params.get('subfolder', '') or '').replace('\\', '/').strip('/')
+    folder_type = params.get('type', 'output').strip()
+
+    if not filename or '\0' in filename or ".." in filename or ".." in subfolder:
+        return web.Response(status=400, headers=CORS_HEADERS)
+
+    source_path = _find_source_video(filename, subfolder, folder_type)
+    if not source_path or not os.path.isfile(source_path):
+        return web.Response(status=404, headers=CORS_HEADERS)
+
+    ext = os.path.splitext(filename)[1].lower()
+    content_type = "video/webm" if ext == ".webm" else "video/mp4"
+    return await video_stream_direct(request, source_path, content_type)
+
+
+@server.routes.options('/api/video_to_webm')
+@server.routes.options('/video_to_webm')
+async def video_to_webm_options(request):
+    return web.Response(status=204, headers=CORS_HEADERS)
+
 @server.routes.get('/api/video_to_webm')
 @server.routes.get('/video_to_webm')
 @server.routes.post('/api/video_to_webm')
@@ -290,40 +431,43 @@ async def video_to_webm_handler(request):
             pass
 
     filename = params.get('filename', '').strip()
-    subfolder = params.get('subfolder', '').strip()
+    subfolder = (params.get('subfolder', '') or '').replace('\\', '/').strip('/')
     folder_type = params.get('type', 'output').strip()
     do_redirect = params.get('redirect', '').lower() in ('1', 'true', 'yes') or params.get('stream', '').lower() in ('1', 'true', 'yes')
 
     if not filename or '\0' in filename:
-        return web.json_response({"error": "Missing or invalid filename parameter", "success": False}, status=400)
+        return web.json_response({"error": "Missing or invalid filename parameter", "success": False}, status=400, headers=CORS_HEADERS)
 
     # Disallow path traversal sequences in subfolder or filename
-    if ".." in filename or ".." in subfolder or '\\' in subfolder or subfolder.startswith('/'):
-        return web.json_response({"error": "Invalid file path", "success": False}, status=400)
+    if ".." in filename or ".." in subfolder or '\0' in subfolder:
+        return web.json_response({"error": "Invalid file path", "success": False}, status=400, headers=CORS_HEADERS)
 
     # Validate file extension
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_VIDEO_EXTS:
-        return web.json_response({"error": f"Unsupported video format: '{ext}'", "success": False}, status=400)
+        return web.json_response({"error": f"Unsupported video format: '{ext}'", "success": False}, status=400, headers=CORS_HEADERS)
 
-    # If the file is already a .webm file, return immediately
+    # If the file is already a .webm file, stream or return stream URL immediately
     if ext == '.webm':
-        sub_param = f"&subfolder={subfolder}" if subfolder else ""
-        view_url = f"/view?filename={filename}{sub_param}&type={folder_type}"
+        source_path = _find_source_video(filename, subfolder, folder_type)
+        if not source_path:
+            return web.json_response({"error": f"Video file '{filename}' not found", "success": False}, status=404, headers=CORS_HEADERS)
         if do_redirect:
-            raise web.HTTPFound(location=view_url)
+            return await video_stream_direct(request, source_path, "video/webm")
+        sub_param = f"&subfolder={subfolder}" if subfolder else ""
+        stream_url = f"/api/video_stream?filename={filename}{sub_param}&type={folder_type}"
         return web.json_response({
             "success": True,
             "filename": filename,
             "subfolder": subfolder,
             "type": folder_type,
-            "url": view_url
-        })
+            "url": stream_url
+        }, headers=CORS_HEADERS)
 
     # Resolve source video file with containment checks
     source_path = _find_source_video(filename, subfolder, folder_type)
     if not source_path:
-        return web.json_response({"error": f"Video file '{filename}' not found", "success": False}, status=404)
+        return web.json_response({"error": f"Video file '{filename}' not found", "success": False}, status=404, headers=CORS_HEADERS)
 
     stat = os.stat(source_path)
     file_hash = hashlib.md5(f"{source_path}:{stat.st_size}:{stat.st_mtime}".encode('utf-8')).hexdigest()[:8]
@@ -342,19 +486,20 @@ async def video_to_webm_handler(request):
         _active_transcodes.pop(dest_path, None)
 
         if not ok or not os.path.isfile(dest_path):
-            return web.json_response({"error": "Failed to transcode video to WebM", "success": False}, status=500)
+            return web.json_response({"error": "Failed to transcode video to WebM", "success": False}, status=500, headers=CORS_HEADERS)
 
-    view_url = f"/view?filename={webm_filename}&type=temp"
+    # Direct stream or stream URL
     if do_redirect:
-        raise web.HTTPFound(location=view_url)
+        return await video_stream_direct(request, dest_path, "video/webm")
 
+    stream_url = f"/api/video_stream?filename={webm_filename}&type=temp"
     return web.json_response({
         "success": True,
         "filename": webm_filename,
         "type": "temp",
-        "url": view_url,
+        "url": stream_url,
         "original_filename": filename
-    })
+    }, headers=CORS_HEADERS)
 
 
 # 5. Non-blocking WebSocket broadcast helpers
@@ -379,8 +524,14 @@ def _broadcast_to_monitors(payload, is_bytes=False):
 
 # 6. Hook server.send_json & server.send_bytes without blocking the main ComfyUI loop
 _original_send_json = server.send_json
+_last_broadcast_node_id = None
 
 async def _mirrored_send_json(event, data, sid=None):
+    global _last_broadcast_node_id
+    if event == "executing" and isinstance(data, dict):
+        node = data.get("node")
+        _last_broadcast_node_id = node if node is not None else None
+
     if _monitor_sockets:
         _broadcast_to_monitors({"type": event, "data": data}, is_bytes=False)
     return await _original_send_json(event, data, sid=sid)
@@ -397,7 +548,38 @@ async def _mirrored_send_bytes(event, data, sid=None):
 
 server.send_bytes = _mirrored_send_bytes
 
-logging.info("[ComfyUIMonitorLink] Initialized successfully. Secondary socket active at /ws/monitor, WebM transcoder at /api/video_to_webm")
+
+# 7. Hook server.queue_updated to broadcast idle execution completion when client_id is null
+_original_queue_updated = server.queue_updated
+
+def _mirrored_queue_updated():
+    global _last_broadcast_node_id
+    res = _original_queue_updated()
+    try:
+        last_node = getattr(server, "last_node_id", None)
+        q_info = server.get_queue_info()
+        rem = q_info.get("exec_info", {}).get("queue_remaining", 0) if isinstance(q_info, dict) else 0
+
+        # If a node was executing and now server.last_node_id is None, prompt execution finished
+        if (_last_broadcast_node_id is not None or rem == 0) and last_node is None:
+            last_prompt = getattr(server, "last_prompt_id", None)
+            _last_broadcast_node_id = None
+            if _monitor_sockets:
+                _broadcast_to_monitors({
+                    "type": "executing",
+                    "data": {"node": None, "prompt_id": last_prompt}
+                }, is_bytes=False)
+                _broadcast_to_monitors({
+                    "type": "execution_success",
+                    "data": {"prompt_id": last_prompt}
+                }, is_bytes=False)
+    except Exception:
+        pass
+    return res
+
+server.queue_updated = _mirrored_queue_updated
+
+logging.info("[ComfyUIMonitorLink] Initialized successfully with hardened security. Secondary socket active at /ws/monitor, WebM transcoder at /api/video_to_webm")
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
